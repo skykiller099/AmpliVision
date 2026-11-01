@@ -61,7 +61,7 @@ static char g_status[160] = "Pret.";
 
 static ID3D11Device* g_dev;
 static ID3D11DeviceContext* g_ctx;
-static IDXGISwapChain* g_swap;
+static IDXGISwapChain1* g_swap;
 static ID3D11RenderTargetView* g_rtv;
 static ID3D11Texture2D *g_dupTex, *g_gdiTex, *g_capTex;
 static ID3D11ShaderResourceView *g_capSrv, *g_blurSrv, *g_histSrv;
@@ -331,14 +331,19 @@ static HRESULT init_d3d(void) {
     }
     if (FAILED(hr)) { logf_("D3D11CreateDevice echec 0x%08X", hr); return hr; }
 
-    DXGI_SWAP_CHAIN_DESC sd = { 0 };
-    sd.BufferCount = 2;
-    sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.OutputWindow = g_over;
+    DXGI_SWAP_CHAIN_DESC1 sd = { 0 };
+    sd.Width = 0;
+    sd.Height = 0;
+    sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    sd.Stereo = FALSE;
     sd.SampleDesc.Count = 1;
-    sd.Windowed = TRUE;
+    sd.SampleDesc.Quality = 0;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferCount = 2;
+    sd.Scaling = DXGI_SCALING_STRETCH;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+    sd.Flags = 0;
 
     IDXGIFactory2* fac = NULL;
     g_adapter->GetParent(__uuidof(IDXGIFactory2), (void**)&fac);
@@ -388,36 +393,47 @@ static void prepare_size(int w, int h) {
     if (w == g_sw && h == g_sh && g_rtv) return;
     release_targets();
 
-    g_swap->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
+    g_swap->ResizeBuffers(0, (UINT)w, (UINT)h, DXGI_FORMAT_UNKNOWN, 0);
     ID3D11Texture2D* bb = NULL;
     g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb);
     g_dev->CreateRenderTargetView(bb, NULL, &g_rtv);
     bb->Release();
 
     D3D11_TEXTURE2D_DESC td = { 0 };
-    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
+    td.Width = (UINT)w;
+    td.Height = (UINT)h;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     g_dev->CreateTexture2D(&td, NULL, &g_dupTex);
-    td.Usage = D3D11_USAGE_DYNAMIC; td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    td.Usage = D3D11_USAGE_DYNAMIC;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     g_dev->CreateTexture2D(&td, NULL, &g_gdiTex);
     g_capTex = g_dupTex;
     g_capSrv = make_srv(g_dupTex);
 
-    td.Usage = D3D11_USAGE_DEFAULT; td.CPUAccessFlags = 0;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.CPUAccessFlags = 0;
     g_dev->CreateTexture2D(&td, NULL, &g_histTex);
     g_histSrv = make_srv(g_histTex);
 
     D3D11_TEXTURE2D_DESC st = td;
-    st.Width = 64; st.Height = 36;
+    st.Width = 64;
+    st.Height = 36;
     st.Usage = D3D11_USAGE_STAGING;
     st.BindFlags = 0;
     st.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     g_dev->CreateTexture2D(&st, NULL, &g_stage);
 
     D3D11_TEXTURE2D_DESC ld = { 0 };
-    ld.Width = w / 2; ld.Height = h / 2; ld.MipLevels = 1; ld.ArraySize = 1;
-    ld.Format = DXGI_FORMAT_R16_FLOAT; ld.SampleDesc.Count = 1;
+    ld.Width = (UINT)(w / 2);
+    ld.Height = (UINT)(h / 2);
+    ld.MipLevels = 1;
+    ld.ArraySize = 1;
+    ld.Format = DXGI_FORMAT_R16_FLOAT;
+    ld.SampleDesc.Count = 1;
     ld.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
     for (int i = 0; i < 2; i++) {
         g_dev->CreateTexture2D(&ld, NULL, &g_luma[i]);
@@ -491,6 +507,7 @@ static void gdi_release(void) {
     free(g_gbuf);
     g_gbuf = NULL;
     g_gw = g_gh = 0;
+    g_gwnd = NULL;
 }
 
 static int grab_window(void) {
@@ -899,7 +916,7 @@ static void toggle_panel(void) {
 
 /* -------------------------------------------------------------- profils */
 
-static void foreground_exe(char* out, int n) {
+static void foreground_exe(char* out) {
     out[0] = 0;
     HWND h = GetForegroundWindow();
     DWORD pid = 0;
@@ -910,7 +927,7 @@ static void foreground_exe(char* out, int n) {
     DWORD sz = MAX_PATH;
     if (QueryFullProcessImageNameA(p, 0, path, &sz)) {
         char* s = strrchr(path, '\\');
-        lstrcpynA(out, s ? s + 1 : path, n);
+        lstrcpynA(out, s ? s + 1 : path, 64);
     }
     CloseHandle(p);
 }
@@ -944,7 +961,7 @@ static LRESULT CALLBACK name_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (LOWORD(w) == 1) {
             GetWindowTextA(g_nameEdit, g_prof[g_nprof].name, 64);
             g_prof[g_nprof].p = g_p;
-            foreground_exe(g_prof[g_nprof].process, 64);
+            foreground_exe(g_prof[g_nprof].process);
             g_nprof++;
             g_selProf = g_nprof - 1;
             save_ini();
