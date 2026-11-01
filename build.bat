@@ -17,7 +17,7 @@ if errorlevel 1 (
 
 if not exist build mkdir build
 rc /nologo /fo build\app.res app.rc || goto :err
-cl /nologo /O2 /W3 /MT /DNDEBUG /Fobuild\ /Fe:build\AmpliVision.exe main.c build\app.res ^
+cl /nologo /TP /O2 /W3 /wd4244 /MT /DNDEBUG /Fobuild\ /Fe:build\AmpliVision.exe main.c build\app.res ^
    /link /SUBSYSTEM:WINDOWS /MANIFEST:NO ^
    d3d11.lib dxgi.lib d3dcompiler.lib user32.lib gdi32.lib shell32.lib || goto :err
 

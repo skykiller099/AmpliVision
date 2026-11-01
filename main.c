@@ -6,6 +6,7 @@
 #include <dxgi1_2.h>
 #include <d3dcompiler.h>
 #include <shellapi.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <math.h>
 #include <stdlib.h>
@@ -56,8 +57,7 @@ static char g_ini[MAX_PATH];
 static FILE* g_log;
 static int g_rebind = -1;
 static int g_warnHotkey;
-static char g_status[160] = "Prêt.";
-static int g_pendingProf = -1;
+static char g_status[160] = "Pret.";
 
 static ID3D11Device* g_dev;
 static ID3D11DeviceContext* g_ctx;
@@ -67,7 +67,7 @@ static ID3D11Texture2D *g_dupTex, *g_gdiTex, *g_capTex;
 static ID3D11ShaderResourceView *g_capSrv, *g_blurSrv, *g_histSrv;
 static ID3D11Texture2D *g_luma[2], *g_blurH, *g_blurV, *g_histTex;
 static ID3D11RenderTargetView *g_lumaRtv[2], *g_blurHRtv, *g_blurVRtv;
-static ID3D11ShaderResourceView *g_lumaSrv[2];
+static ID3D11ShaderResourceView *g_lumaSrv[2], *g_blurHSrv;
 static int g_lumaIdx;
 static ID3D11VertexShader* g_vs;
 static ID3D11PixelShader *g_psLuma, *g_psBlur, *g_psComp;
@@ -81,6 +81,7 @@ static int g_sw, g_sh, g_ready;
 static ID3D11Texture2D* g_stage;
 static UINT64 g_frame;
 
+static HWND g_gwnd;
 static HDC g_gdc, g_gmdc;
 static HBITMAP g_gbmp;
 static int g_gw, g_gh;
@@ -93,6 +94,8 @@ static int g_nmon;
 
 static void load_ini(void);
 static void save_ini(void);
+static void apply_overlay_style(void);
+static void place_overlay(void);
 
 /* ------------------------------------------------------------- journal */
 
@@ -267,6 +270,7 @@ static void release_targets(void) {
         if (g_lumaRtv[i]) { g_lumaRtv[i]->Release(); g_lumaRtv[i] = NULL; }
         if (g_luma[i]) { g_luma[i]->Release(); g_luma[i] = NULL; }
     }
+    if (g_blurHSrv) { g_blurHSrv->Release(); g_blurHSrv = NULL; }
     if (g_blurHRtv) { g_blurHRtv->Release(); g_blurHRtv = NULL; }
     if (g_blurVRtv) { g_blurVRtv->Release(); g_blurVRtv = NULL; }
     if (g_blurH) { g_blurH->Release(); g_blurH = NULL; }
@@ -315,7 +319,9 @@ static HRESULT init_d3d(void) {
     HRESULT hr = D3D11CreateDevice(ad, ad ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
                                    NULL, 0, NULL, 0, D3D11_SDK_VERSION,
                                    &g_dev, &fl, &g_ctx);
-    if (ad) { g_adapter = ad; } else {
+    if (ad) {
+        g_adapter = ad;
+    } else {
         IDXGIDevice* dxd = NULL;
         g_dev->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxd);
         IDXGIAdapter* a2 = NULL;
@@ -420,6 +426,7 @@ static void prepare_size(int w, int h) {
     }
     g_dev->CreateTexture2D(&ld, NULL, &g_blurH);
     g_dev->CreateRenderTargetView(g_blurH, NULL, &g_blurHRtv);
+    g_blurHSrv = make_srv(g_blurH);
     g_dev->CreateTexture2D(&ld, NULL, &g_blurV);
     g_dev->CreateRenderTargetView(g_blurV, NULL, &g_blurVRtv);
     g_blurSrv = make_srv(g_blurV);
@@ -477,6 +484,15 @@ static int grab_dup(void) {
     return 1;
 }
 
+static void gdi_release(void) {
+    if (g_gbmp) { DeleteObject(g_gbmp); g_gbmp = NULL; }
+    if (g_gmdc) { DeleteDC(g_gmdc); g_gmdc = NULL; }
+    if (g_gdc) { ReleaseDC(g_gwnd, g_gdc); g_gdc = NULL; }
+    free(g_gbuf);
+    g_gbuf = NULL;
+    g_gw = g_gh = 0;
+}
+
 static int grab_window(void) {
     HWND h = FindWindowA(NULL, g_cfg.targetTitle);
     if (!h) return 0;
@@ -485,15 +501,13 @@ static int grab_window(void) {
     int w = r.right, ht = r.bottom;
     if (w < 16 || ht < 16) return 0;
 
-    if (!g_gbuf || w != g_gw || ht != g_gh) {
-        if (g_gbmp) DeleteObject(g_gbmp);
-        if (g_gmdc) DeleteDC(g_gmdc);
-        if (g_gdc) ReleaseDC(NULL, g_gdc);
+    if (!g_gbuf || w != g_gw || ht != g_gh || h != g_gwnd) {
+        gdi_release();
+        g_gwnd = h;
         g_gdc = GetWindowDC(h);
         g_gmdc = CreateCompatibleDC(g_gdc);
         g_gbmp = CreateCompatibleBitmap(g_gdc, w, ht);
         SelectObject(g_gmdc, g_gbmp);
-        free(g_gbuf);
         g_gbuf = malloc((size_t)w * ht * 4);
         g_gw = w; g_gh = ht;
     }
@@ -574,15 +588,9 @@ static void render_frame(void) {
 
     float c3[4] = { 1.0f / hw, 1.0f / hh, 0.0f, 1.0f };
     set_cb(c3);
-    g_ctx->PSSetShaderResources(0, 1, &g_blurH ? &g_blurSrv : &g_blurSrv);
-    {
-        ID3D11ShaderResourceView* hsrv = NULL;
-        g_blurH->QueryInterface(__uuidof(ID3D11ShaderResourceView), (void**)&hsrv);
-        g_ctx->PSSetShaderResources(0, 1, &hsrv);
-        g_ctx->OMSetRenderTargets(1, &g_blurVRtv, NULL);
-        draw_tri();
-        hsrv->Release();
-    }
+    g_ctx->PSSetShaderResources(0, 1, &g_blurHSrv);
+    g_ctx->OMSetRenderTargets(1, &g_blurVRtv, NULL);
+    draw_tri();
 
     float c[24] = {
         1.0f / g_sw, 1.0f / g_sh, (float)g_sw / (float)(g_sh ? g_sh : 1), (float)(g_frame % 64),
@@ -628,4 +636,614 @@ static void hist_update(void) {
         }
     }
     g_ctx->Unmap(g_stage, 0);
+}
+
+/* ------------------------------------------------------------------ UI */
+
+typedef struct { RECT r; int type; void* target; float mn, mx; } Hit;
+static Hit g_hits[220];
+static int g_nhits;
+static int g_active = -1;
+
+static void ui_fill(HDC dc, int x, int y, int w, int h, COLORREF c) {
+    RECT r = { x, y, x + w, y + h };
+    HBRUSH b = CreateSolidBrush(c);
+    FillRect(dc, &r, b);
+    DeleteObject(b);
+}
+static void ui_text(HDC dc, int x, int y, const char* s, COLORREF c, int bold) {
+    SetTextColor(dc, c);
+    SetBkMode(dc, TRANSPARENT);
+    HFONT f = CreateFontA(bold ? 15 : 13, 0, 0, 0, bold ? FW_SEMIBOLD : FW_NORMAL,
+                          0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
+    HFONT old = (HFONT)SelectObject(dc, f);
+    TextOutA(dc, x, y, s, lstrlenA(s));
+    SelectObject(dc, old);
+    DeleteObject(f);
+}
+static void ui_slider(HDC dc, int* y, int x, int w, const char* label, float* v, float mn, float mx) {
+    char b[32];
+    ui_text(dc, x, *y, label, RGB(150, 160, 175), 0);
+    sprintf(b, "%.2f", *v);
+    ui_text(dc, x + w - 40, *y, b, RGB(245, 197, 66), 0);
+    int ty = *y + 18;
+    ui_fill(dc, x, ty, w, 4, RGB(40, 46, 58));
+    float rel = (*v - mn) / (mx - mn);
+    if (rel < 0) rel = 0;
+    if (rel > 1) rel = 1;
+    ui_fill(dc, x, ty, (int)(w * rel), 4, RGB(245, 197, 66));
+    ui_fill(dc, x + (int)(w * rel) - 5, ty - 4, 10, 12, RGB(255, 255, 255));
+    if (g_nhits < 220) {
+        RECT r = { x, ty - 9, x + w, ty + 15 };
+        g_hits[g_nhits].r = r;
+        g_hits[g_nhits].type = 1;
+        g_hits[g_nhits].target = v;
+        g_hits[g_nhits].mn = mn;
+        g_hits[g_nhits].mx = mx;
+        g_nhits++;
+    }
+    *y += 40;
+}
+static void ui_toggle(HDC dc, int* y, int x, int w, const char* label, int* v) {
+    ui_text(dc, x, *y, label, RGB(200, 208, 220), 0);
+    int bx = x + w - 42;
+    ui_fill(dc, bx, *y, 42, 18, *v ? RGB(245, 197, 66) : RGB(40, 46, 58));
+    ui_fill(dc, *v ? bx + 24 : bx + 2, *y + 2, 16, 14, RGB(255, 255, 255));
+    if (g_nhits < 220) {
+        RECT r = { bx, *y - 3, bx + 42, *y + 21 };
+        g_hits[g_nhits].r = r;
+        g_hits[g_nhits].type = 2;
+        g_hits[g_nhits].target = v;
+        g_nhits++;
+    }
+    *y += 30;
+}
+static void ui_button(HDC dc, int x, int y, int w, int h, const char* label, int on, int id) {
+    ui_fill(dc, x, y, w, h, on ? RGB(245, 197, 66) : RGB(32, 37, 46));
+    ui_text(dc, x + 10, y + 4, label, on ? RGB(18, 21, 27) : RGB(215, 222, 232), 0);
+    if (g_nhits < 220) {
+        RECT r = { x, y, x + w, y + h };
+        g_hits[g_nhits].r = r;
+        g_hits[g_nhits].type = 3;
+        g_hits[g_nhits].target = (void*)(INT_PTR)id;
+        g_nhits++;
+    }
+}
+
+static const char* VK_NAME(int vk) {
+    static char b[16];
+    if (vk >= VK_F1 && vk <= VK_F24) { sprintf(b, "F%d", vk - VK_F1 + 1); return b; }
+    if (vk >= '0' && vk <= '9') { b[0] = (char)vk; b[1] = 0; return b; }
+    if (vk >= 'A' && vk <= 'Z') { b[0] = (char)vk; b[1] = 0; return b; }
+    sprintf(b, "0x%02X", vk);
+    return b;
+}
+
+static const char* PRESET_NAME[] = { "Discret", "Plein jour", "Vision nocturne",
+                                     "FPS comp", "Horreur", "Maximum" };
+static const Params PRESET[6] = {
+    { 1.25f, 1.20f, 0.28f, 0.03f, 0.35f, 1.04f, 1.05f, 0.10f, 0.00f, 0.40f, 0.20f, 0.02f, 0.00f, 0.25f, 0.20f },
+    { 2.40f, 1.75f, 0.72f, 0.14f, 0.70f, 1.16f, 1.28f, 0.25f, 0.02f, 0.70f, 0.55f, 0.05f, 0.00f, 0.35f, 0.30f },
+    { 2.00f, 2.00f, 0.85f, 0.20f, 1.00f, 1.10f, 0.30f, 0.05f, -0.25f, 0.75f, 0.60f, 0.06f, 0.00f, 0.45f, 0.45f },
+    { 2.00f, 1.55f, 0.60f, 0.05f, 1.30f, 1.26f, 0.82f, 0.20f, 0.00f, 0.55f, 0.50f, 0.04f, 0.00f, 0.20f, 0.10f },
+    { 1.60f, 1.40f, 0.50f, 0.08f, 0.55f, 1.20f, 0.85f, 0.15f, 0.12f, 0.45f, 0.30f, 0.03f, 0.00f, 0.30f, 0.25f },
+    { 3.40f, 2.30f, 1.00f, 0.24f, 1.50f, 1.32f, 1.30f, 0.30f, 0.00f, 0.95f, 0.80f, 0.08f, 0.40f, 0.55f, 0.55f }
+};
+
+static BOOL CALLBACK mon_cb(HMONITOR m, HDC d, LPRECT r, LPARAM l) {
+    (void)d; (void)r; (void)l;
+    if (g_nmon < MAX_MON) g_mons[g_nmon++] = m;
+    return TRUE;
+}
+static void refresh_monitors(void) {
+    g_nmon = 0;
+    EnumDisplayMonitors(NULL, NULL, mon_cb, 0);
+}
+
+static void paint_panel(HDC dc) {
+    g_nhits = 0;
+    ui_fill(dc, 0, 0, PANEL_W, PANEL_H, RGB(18, 21, 27));
+    ui_text(dc, 20, 12, "AmpliVision", RGB(240, 244, 250), 1);
+    ui_text(dc, 148, 16, "F8 afficher/masquer  ·  F9 panneau  ·  F7 comparer", RGB(110, 120, 135), 0);
+    if (g_warnHotkey) ui_text(dc, 560, 16, "raccourci deja reserve", RGB(230, 120, 90), 0);
+
+    int bx = 20;
+    for (int i = 0; i < 6; i++) {
+        char b[40];
+        sprintf(b, "%d  %s", i + 1, PRESET_NAME[i]);
+        ui_button(dc, bx, 42, 100, 24, b, 0, 100 + i);
+        bx += 106;
+    }
+    ui_button(dc, bx, 42, 110, 24, g_captureOn ? "Arreter" : "Demarrer", g_captureOn, 1);
+
+    ui_fill(dc, 0, 78, PANEL_W, 1, RGB(38, 44, 55));
+
+    int cy = 92;
+    ui_text(dc, 20, cy, "Image", RGB(245, 197, 66), 1);
+    cy += 24;
+    ui_slider(dc, &cy, 20, 270, "Exposition", &g_p.exposure, 0.2f, 4.0f);
+    ui_slider(dc, &cy, 20, 270, "Gamma", &g_p.gamma, 0.5f, 3.0f);
+    ui_slider(dc, &cy, 20, 270, "Gain adaptatif des ombres", &g_p.local, 0.0f, 1.0f);
+    ui_slider(dc, &cy, 20, 270, "Releve des noirs", &g_p.blacks, 0.0f, 0.5f);
+    ui_slider(dc, &cy, 20, 270, "Nettete", &g_p.sharpen, 0.0f, 1.6f);
+    ui_slider(dc, &cy, 20, 270, "Contraste", &g_p.contrast, 0.6f, 2.0f);
+    ui_slider(dc, &cy, 20, 270, "Saturation", &g_p.sat, 0.0f, 2.0f);
+    ui_slider(dc, &cy, 20, 270, "Vibrance", &g_p.vibrance, 0.0f, 1.0f);
+    ui_slider(dc, &cy, 20, 270, "Temperature", &g_p.temp, -1.0f, 1.0f);
+    ui_slider(dc, &cy, 20, 270, "Compression hautes lumieres", &g_p.rolloff, 0.0f, 1.0f);
+    ui_slider(dc, &cy, 20, 270, "Vignettage", &g_p.vig, 0.0f, 1.0f);
+
+    int dy = 92;
+    ui_text(dc, 315, dy, "Traitement", RGB(245, 197, 66), 1);
+    dy += 24;
+    ui_slider(dc, &dy, 315, 270, "Denoise temporelle", &g_p.temporal, 0.0f, 0.9f);
+    ui_slider(dc, &dy, 315, 270, "Anti-banding (dither)", &g_p.dither, 0.0f, 1.0f);
+    ui_slider(dc, &dy, 315, 270, "Auto-exposition", &g_p.autoAmt, 0.0f, 1.0f);
+
+    ui_text(dc, 315, dy + 6, "Histogramme de la scene", RGB(245, 197, 66), 1);
+    dy += 26;
+    ui_fill(dc, 315, dy, 270, 62, RGB(26, 30, 38));
+    for (int i = 0; i < 64; i++) {
+        int hh = (int)(g_hist[i] * 1.6f);
+        if (hh > 58) hh = 58;
+        ui_fill(dc, 316 + i * 4, dy + 60 - hh, 3, hh, RGB(245, 197, 66));
+    }
+    dy += 74;
+
+    ui_text(dc, 315, dy, "Systeme", RGB(245, 197, 66), 1);
+    dy += 24;
+    ui_toggle(dc, &dy, 315, 270, "Clic traversant", &g_cfg.clickThrough);
+    ui_toggle(dc, &dy, 315, 270, "Exclure l'overlay de la capture", &g_cfg.excludeCap);
+    ui_toggle(dc, &dy, 315, 270, "V-Sync", &g_cfg.vsync);
+    ui_toggle(dc, &dy, 315, 270, "Demarrer masque", &g_cfg.startHidden);
+    ui_button(dc, 315, dy + 4, 130, 24, "Sauver", 0, 2);
+    ui_button(dc, 455, dy + 4, 130, 24, "Reinitialiser", 0, 3);
+
+    int ey = 92;
+    ui_text(dc, 610, ey, "Raccourcis", RGB(245, 197, 66), 1);
+    ey += 24;
+    const char* hkl[3] = { "Afficher / masquer", "Panneau", "Comparer (maintien)" };
+    int* hkv[3] = { &g_cfg.hkToggle, &g_cfg.hkPanel, &g_cfg.hkCompare };
+    for (int i = 0; i < 3; i++) {
+        ui_text(dc, 610, ey, hkl[i], RGB(200, 208, 220), 0);
+        char b[24];
+        sprintf(b, "%s", g_rebind == 200 + i ? "..." : VK_NAME(*hkv[i]));
+        ui_button(dc, 790, ey - 3, 110, 22, b, g_rebind == 200 + i, 200 + i);
+        ey += 28;
+    }
+
+    ui_text(dc, 610, ey + 4, "Ecran cible", RGB(245, 197, 66), 1);
+    ey += 26;
+    refresh_monitors();
+    for (int i = 0; i < g_nmon && i < 4; i++) {
+        char b[24];
+        sprintf(b, "Ecran %d", i + 1);
+        ui_button(dc, 610 + i * 62, ey, 56, 22, b, g_cfg.targetMon == i, 300 + i);
+    }
+    ey += 32;
+
+    ui_text(dc, 610, ey, "Profils par jeu", RGB(245, 197, 66), 1);
+    ey += 24;
+    for (int i = 0; i < g_nprof && i < 8; i++) {
+        ui_fill(dc, 610, ey + i * 22, 290, 20, i == g_selProf ? RGB(52, 60, 74) : RGB(28, 32, 40));
+        ui_text(dc, 616, ey + i * 22 + 2, g_prof[i].name, RGB(220, 226, 236), 0);
+        ui_text(dc, 616 + 130, ey + i * 22 + 2,
+                g_prof[i].process[0] ? g_prof[i].process : "-", RGB(120, 130, 145), 0);
+        if (g_nhits < 220) {
+            RECT r = { 610, ey + i * 22, 900, ey + i * 22 + 20 };
+            g_hits[g_nhits].r = r;
+            g_hits[g_nhits].type = 4;
+            g_hits[g_nhits].target = (void*)(INT_PTR)i;
+            g_nhits++;
+        }
+    }
+    int py = ey + 8 * 22 + 4;
+    ui_button(dc, 610, py, 140, 22, "Nouveau depuis reglages", 0, 400);
+    ui_button(dc, 758, py, 142, 22, "Lier au jeu actif", 0, 401);
+    py += 26;
+    ui_button(dc, 610, py, 90, 22, "Charger", 0, 402);
+    ui_button(dc, 708, py, 90, 22, "Supprimer", 0, 403);
+    ui_button(dc, 806, py, 94, 22, "Exporter", 0, 404);
+
+    ui_fill(dc, 0, PANEL_H - 26, PANEL_W, 1, RGB(38, 44, 55));
+    ui_text(dc, 20, PANEL_H - 20, g_status, RGB(120, 130, 145), 0);
+}
+
+static void apply_overlay_style(void) {
+    LONG ex = GetWindowLongW(g_over, GWL_EXSTYLE);
+    ex |= WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+    if (g_cfg.clickThrough) ex |= WS_EX_TRANSPARENT;
+    else ex &= ~WS_EX_TRANSPARENT;
+    SetWindowLongW(g_over, GWL_EXSTYLE, ex);
+    SetWindowPos(g_over, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetWindowDisplayAffinity(g_over, g_cfg.excludeCap ? WDA_EXCL : 0);
+}
+
+static void place_overlay(void) {
+    HMONITOR mon = MonitorFromWindow(g_over, MONITOR_DEFAULTTONEAREST);
+    refresh_monitors();
+    if (g_cfg.targetMon >= 0 && g_cfg.targetMon < g_nmon) mon = g_mons[g_cfg.targetMon];
+    MONITORINFO mi = { sizeof(mi) };
+    GetMonitorInfo(mon, &mi);
+    int w = mi.rcMonitor.right - mi.rcMonitor.left;
+    int h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+    SetWindowPos(g_over, HWND_TOPMOST, mi.rcMonitor.left, mi.rcMonitor.top, w, h, SWP_NOACTIVATE);
+    if (g_ready) prepare_size(w, h);
+    drop_dup();
+}
+
+static void toggle_overlay(void) {
+    g_hidden = !g_hidden;
+    ShowWindow(g_over, g_hidden ? SW_HIDE : SW_SHOWNOACTIVATE);
+    if (!g_hidden) {
+        place_overlay();
+        apply_overlay_style();
+    } else {
+        drop_dup();
+    }
+}
+
+static void toggle_panel(void) {
+    g_panelOpen = !g_panelOpen;
+    if (g_panelOpen) {
+        RECT wa;
+        SystemParametersInfo(SPI_GETWORKAREA, 0, &wa, 0);
+        SetWindowPos(g_panel, HWND_TOPMOST,
+                     wa.right - PANEL_W - 20, wa.top + 20, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+        ShowWindow(g_panel, SW_SHOWNOACTIVATE);
+        InvalidateRect(g_panel, NULL, FALSE);
+    } else {
+        ShowWindow(g_panel, SW_HIDE);
+    }
+}
+
+/* -------------------------------------------------------------- profils */
+
+static void foreground_exe(char* out, int n) {
+    out[0] = 0;
+    HWND h = GetForegroundWindow();
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!p) return;
+    char path[MAX_PATH] = { 0 };
+    DWORD sz = MAX_PATH;
+    if (QueryFullProcessImageNameA(p, 0, path, &sz)) {
+        char* s = strrchr(path, '\\');
+        lstrcpynA(out, s ? s + 1 : path, n);
+    }
+    CloseHandle(p);
+}
+
+static void profile_apply(int i) {
+    if (i < 0 || i >= g_nprof) return;
+    g_p = g_prof[i].p;
+    g_selProf = i;
+    wsprintfA(g_status, "Profil %s charge.", g_prof[i].name);
+}
+
+static void auto_profile(void) {
+    static ULONGLONG last = 0;
+    ULONGLONG now = GetTickCount64();
+    if (now - last < 1200) return;
+    last = now;
+    char exe[64];
+    foreground_exe(exe);
+    if (!exe[0]) return;
+    for (int i = 0; i < g_nprof; i++) {
+        if (g_prof[i].process[0] && lstrcmpiA(g_prof[i].process, exe) == 0) {
+            if (g_selProf != i) profile_apply(i);
+            return;
+        }
+    }
+}
+
+static LRESULT CALLBACK name_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_COMMAND:
+        if (LOWORD(w) == 1) {
+            GetWindowTextA(g_nameEdit, g_prof[g_nprof].name, 64);
+            g_prof[g_nprof].p = g_p;
+            foreground_exe(g_prof[g_nprof].process, 64);
+            g_nprof++;
+            g_selProf = g_nprof - 1;
+            save_ini();
+            DestroyWindow(h);
+            g_nameDlg = NULL;
+            InvalidateRect(g_panel, NULL, FALSE);
+        } else if (LOWORD(w) == 2) {
+            DestroyWindow(h);
+            g_nameDlg = NULL;
+        }
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(h);
+        g_nameDlg = NULL;
+        return 0;
+    }
+    return DefWindowProcA(h, m, w, l);
+}
+
+static void ask_profile_name(void) {
+    if (g_nprof >= MAX_PROFILES) {
+        lstrcpyA(g_status, "Nombre maximal de profils atteint.");
+        return;
+    }
+    if (g_nameDlg) return;
+    WNDCLASSA wc = { 0 };
+    wc.lpfnWndProc = name_proc;
+    wc.hInstance = g_inst;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = CreateSolidBrush(RGB(24, 28, 36));
+    wc.lpszClassName = "AmpliName";
+    RegisterClassA(&wc);
+
+    RECT wa;
+    SystemParametersInfo(SPI_GETWORKAREA, 0, &wa, 0);
+    g_nameDlg = CreateWindowExA(WS_EX_TOPMOST, "AmpliName", "Nom du profil",
+                                WS_POPUP | WS_BORDER, wa.left + 300, wa.top + 240, 340, 108,
+                                NULL, NULL, g_inst, NULL);
+    g_nameEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
+                                 WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                                 16, 16, 308, 24, g_nameDlg, NULL, g_inst, NULL);
+    CreateWindowA("BUTTON", "OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+                  150, 54, 80, 26, g_nameDlg, (HMENU)1, g_inst, NULL);
+    CreateWindowA("BUTTON", "Annuler", WS_CHILD | WS_VISIBLE,
+                  240, 54, 84, 26, g_nameDlg, (HMENU)2, g_inst, NULL);
+    ShowWindow(g_nameDlg, SW_SHOW);
+    SetFocus(g_nameEdit);
+}
+
+/* ----------------------------------------------------------- fenetres */
+
+static void on_hit(int id) {
+    if (id >= 100 && id < 106) { g_p = PRESET[id - 100]; return; }
+    if (id >= 300 && id < 304) {
+        g_cfg.targetMon = id - 300;
+        place_overlay();
+        apply_overlay_style();
+        return;
+    }
+    if (id >= 200 && id < 203) { g_rebind = id; return; }
+    switch (id) {
+    case 1:
+        g_captureOn = !g_captureOn;
+        if (!g_captureOn) drop_dup();
+        break;
+    case 2:
+        save_ini();
+        lstrcpyA(g_status, "Reglages sauvegardes.");
+        break;
+    case 3:
+        g_p = g_def;
+        break;
+    case 400:
+        ask_profile_name();
+        break;
+    case 401: {
+        char exe[64];
+        foreground_exe(exe);
+        if (g_selProf >= 0 && exe[0]) {
+            lstrcpyA(g_prof[g_selProf].process, exe);
+            wsprintfA(g_status, "Profil lie a %s.", exe);
+            save_ini();
+        }
+        break;
+    }
+    case 402:
+        profile_apply(g_selProf);
+        break;
+    case 403:
+        if (g_selProf >= 0) {
+            for (int i = g_selProf; i < g_nprof - 1; i++) g_prof[i] = g_prof[i + 1];
+            g_nprof--;
+            g_selProf = -1;
+            save_ini();
+            lstrcpyA(g_status, "Profil supprime.");
+        }
+        break;
+    case 404: {
+        char path[MAX_PATH];
+        char dir[MAX_PATH];
+        lstrcpynA(dir, g_ini, MAX_PATH);
+        char* s = strrchr(dir, '\\');
+        if (s) *s = 0;
+        wsprintfA(path, "%s\\profils-export.ini", dir);
+        CopyFileA(g_ini, path, FALSE);
+        wsprintfA(g_status, "Exporte vers %s", path);
+        break;
+    }
+    }
+}
+
+static LRESULT CALLBACK over_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_ERASEBKGND: return 1;
+    case WM_DISPLAYCHANGE:
+        place_overlay();
+        apply_overlay_style();
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static LRESULT CALLBACK panel_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        HDC mem = CreateCompatibleDC(dc);
+        HBITMAP bmp = CreateCompatibleBitmap(dc, PANEL_W, PANEL_H);
+        HGDIOBJ old = SelectObject(mem, bmp);
+        paint_panel(mem);
+        BitBlt(dc, 0, 0, PANEL_W, PANEL_H, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, old);
+        DeleteObject(bmp);
+        DeleteDC(mem);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        g_mx = GET_X_LPARAM(l);
+        g_my = GET_Y_LPARAM(l);
+        if (g_active >= 0 && g_active < g_nhits && g_hits[g_active].type == 1) {
+            Hit* t = &g_hits[g_active];
+            float rel = (float)(g_mx - t->r.left) / (float)(t->r.right - t->r.left);
+            if (rel < 0) rel = 0;
+            if (rel > 1) rel = 1;
+            *(float*)t->target = t->mn + rel * (t->mx - t->mn);
+        }
+        InvalidateRect(h, NULL, FALSE);
+        return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        g_mx = GET_X_LPARAM(l);
+        g_my = GET_Y_LPARAM(l);
+        POINT pt = { g_mx, g_my };
+        for (int i = 0; i < g_nhits; i++) {
+            if (PtInRect(&g_hits[i].r, pt)) {
+                if (g_hits[i].type == 3) on_hit((int)(INT_PTR)g_hits[i].target);
+                else if (g_hits[i].type == 2) *(int*)g_hits[i].target ^= 1;
+                else if (g_hits[i].type == 4) g_selProf = (int)(INT_PTR)g_hits[i].target;
+                else g_active = i;
+                break;
+            }
+        }
+        InvalidateRect(h, NULL, FALSE);
+        return 0;
+    }
+    case WM_LBUTTONUP:
+        g_active = -1;
+        InvalidateRect(h, NULL, FALSE);
+        return 0;
+    case WM_CLOSE:
+        ShowWindow(h, SW_HIDE);
+        g_panelOpen = 0;
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static void rebind_done(int vk) {
+    if (vk == VK_ESCAPE) { g_rebind = -1; return; }
+    if (g_rebind == 200) {
+        UnregisterHotKey(g_panel, HOT_TOGGLE);
+        g_cfg.hkToggle = vk;
+        RegisterHotKey(g_panel, HOT_TOGGLE, MOD_NOREPEAT, vk);
+    } else if (g_rebind == 201) {
+        UnregisterHotKey(g_panel, HOT_PANEL);
+        g_cfg.hkPanel = vk;
+        RegisterHotKey(g_panel, HOT_PANEL, MOD_NOREPEAT, vk);
+    } else if (g_rebind == 202) {
+        g_cfg.hkCompare = vk;
+    }
+    save_ini();
+    g_rebind = -1;
+}
+
+/* --------------------------------------------------------------- main */
+
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show) {
+    (void)prev; (void)cmd; (void)show;
+    g_inst = inst;
+
+    typedef BOOL (WINAPI * PFN_DPI)(HANDLE);
+    HMODULE u32 = GetModuleHandleW(L"user32.dll");
+    PFN_DPI dpi = (PFN_DPI)GetProcAddress(u32, "SetProcessDpiAwarenessContext");
+    if (dpi) dpi((HANDLE)-4);
+
+    get_ini_path();
+    load_ini();
+    g_p = g_def;
+
+    WNDCLASSEXW wc = { sizeof(wc), CS_HREDRAW | CS_VREDRAW };
+    wc.lpfnWndProc = over_proc;
+    wc.hInstance = inst;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.lpszClassName = CLS_OVER;
+    RegisterClassExW(&wc);
+
+    g_over = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+                             CLS_OVER, APPNAME, WS_POPUP,
+                             0, 0, 1920, 1080, NULL, NULL, inst, NULL);
+    if (!g_over) { logf_("overlay non cree"); return 1; }
+
+    wc.lpfnWndProc = panel_proc;
+    wc.lpszClassName = CLS_PANEL;
+    RegisterClassExW(&wc);
+    g_panel = CreateWindowExW(WS_EX_TOOLWINDOW, CLS_PANEL, L"AmpliVision",
+                              WS_POPUP | WS_BORDER, 100, 100, PANEL_W, PANEL_H,
+                              NULL, NULL, inst, NULL);
+
+    if (FAILED(init_d3d())) {
+        MessageBoxW(NULL, L"Direct3D 11 indisponible. Verifie les pilotes graphiques.",
+                    APPNAME, MB_ICONERROR);
+        return 1;
+    }
+
+    place_overlay();
+    apply_overlay_style();
+    g_captureOn = 1;
+    if (g_cfg.startHidden) {
+        g_hidden = 1;
+        ShowWindow(g_over, SW_HIDE);
+    } else {
+        ShowWindow(g_over, SW_SHOWNOACTIVATE);
+    }
+
+    if (!RegisterHotKey(g_panel, HOT_TOGGLE, MOD_NOREPEAT, g_cfg.hkToggle)) g_warnHotkey = 1;
+    if (!RegisterHotKey(g_panel, HOT_PANEL, MOD_NOREPEAT, g_cfg.hkPanel)) g_warnHotkey = 1;
+    for (int i = 0; i < 9; i++)
+        if (!RegisterHotKey(g_panel, HOT_PRESET + i, MOD_NOREPEAT, g_cfg.hkPreset[i])) g_warnHotkey = 1;
+
+    MSG msg;
+    while (g_running) {
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_HOTKEY) {
+                if (msg.wParam == HOT_TOGGLE) toggle_overlay();
+                else if (msg.wParam == HOT_PANEL) toggle_panel();
+                else if (msg.wParam >= HOT_PRESET && msg.wParam < HOT_PRESET + 9) {
+                    int i = (int)msg.wParam - HOT_PRESET;
+                    if (i < 6) g_p = PRESET[i];
+                }
+                continue;
+            }
+            if (msg.message == WM_QUIT) { g_running = 0; break; }
+            if (g_rebind >= 0 && msg.message == WM_KEYDOWN) {
+                rebind_done((int)msg.wParam);
+                InvalidateRect(g_panel, NULL, FALSE);
+                continue;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+
+        g_compare = (GetAsyncKeyState(g_cfg.hkCompare) & 0x8000) != 0;
+        auto_profile();
+
+        ULONGLONG t0 = GetTickCount64();
+        if (!g_hidden) {
+            render_frame();
+            hist_update();
+        }
+        if (g_panelOpen) InvalidateRect(g_panel, NULL, FALSE);
+
+        int budget = 1000 / (g_cfg.maxFps > 0 ? g_cfg.maxFps : 120);
+        int spent = (int)(GetTickCount64() - t0);
+        if (spent < budget) Sleep(budget - spent);
+    }
+
+    UnregisterHotKey(g_panel, HOT_TOGGLE);
+    UnregisterHotKey(g_panel, HOT_PANEL);
+    for (int i = 0; i < 9; i++) UnregisterHotKey(g_panel, HOT_PRESET + i);
+    save_ini();
+    drop_dup();
+    gdi_release();
+    release_targets();
+    if (g_swap) g_swap->Release();
+    if (g_ctx) g_ctx->Release();
+    if (g_dev) g_dev->Release();
+    if (g_log) fclose(g_log);
+    return 0;
 }
