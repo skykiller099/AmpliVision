@@ -1,0 +1,90 @@
+// shaders.h - pipeline HLSL compilé au runtime
+#pragma once
+
+static const char* VS_FULL =
+"struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
+"VSOut main(uint id : SV_VertexID) {\n"
+"  VSOut o; float2 p = float2((id << 1) & 2, id & 2);\n"
+"  o.uv = p; o.pos = float4(p * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+"  return o;\n"
+"}\n";
+
+// passe 1 : luminance reduite + lissage temporel de la cle de scene
+static const char* PS_LUMA =
+"cbuffer K : register(b0) { float4 P; };\n"
+"Texture2D<float4> Src : register(t0);\n"
+"Texture2D<float> Prev : register(t1);\n"
+"SamplerState Smp : register(s0);\n"
+"float Lm(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }\n"
+"float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
+"  float2 t = P.xy;\n"
+"  float l = 0;\n"
+"  l += Lm(Src.Sample(Smp, uv + float2(-t.x, -t.y)).rgb);\n"
+"  l += Lm(Src.Sample(Smp, uv + float2( t.x, -t.y)).rgb);\n"
+"  l += Lm(Src.Sample(Smp, uv + float2(-t.x,  t.y)).rgb);\n"
+"  l += Lm(Src.Sample(Smp, uv + float2( t.x,  t.y)).rgb);\n"
+"  l *= 0.25;\n"
+"  float p = Prev.Sample(Smp, uv);\n"
+"  return float4(lerp(l, p, saturate(P.z)), 0, 0, 0);\n"
+"}\n";
+
+// passe 2 : flou separable gaussien sur la luminance
+static const char* PS_BLUR =
+"cbuffer K : register(b0) { float4 P; };\n"
+"Texture2D<float> Src : register(t0);\n"
+"SamplerState Smp : register(s0);\n"
+"float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
+"  float2 s = P.xy * P.zw;\n"
+"  float v = Src.Sample(Smp, uv).x * 0.2270270270;\n"
+"  v += (Src.Sample(Smp, uv + s * 1.3846).x + Src.Sample(Smp, uv - s * 1.3846).x) * 0.3162162162;\n"
+"  v += (Src.Sample(Smp, uv + s * 3.2307).x + Src.Sample(Smp, uv - s * 3.2307).x) * 0.0702702703;\n"
+"  return float4(v, 0, 0, 0);\n"
+"}\n";
+
+// passe 3 : courbe de ton complete
+static const char* PS_COMP =
+"cbuffer K : register(b0) {\n"
+"  float4 A; float4 B; float4 C; float4 D; float4 E; float4 F;\n"
+"};\n"
+"Texture2D<float4> Src : register(t0);\n"
+"Texture2D<float> Blur : register(t1);\n"
+"Texture2D<float4> Hist : register(t2);\n"
+"SamplerState Smp : register(s0);\n"
+"float Lm(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }\n"
+"float hash(float2 p) { return frac(sin(dot(p, float2(12.9898, 78.233))) * 43758.5453); }\n"
+"float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
+"  float3 raw = Src.Sample(Smp, uv).rgb;\n"
+"  float3 c = raw;\n"
+"  if (F.x > 0.001) {\n"
+"    float3 h = Hist.Sample(Smp, uv).rgb;\n"
+"    float d = abs(Lm(c) - Lm(h));\n"
+"    c = lerp(c, h, F.x * saturate(1.0 - d * 6.0));\n"
+"  }\n"
+"  float key = max(Blur.Sample(Smp, uv).x, 0.0001);\n"
+"  float3 detail = c - key.xxx;\n"
+"  float dark = saturate(1.0 - key * 2.2);\n"
+"  c *= 1.0 + B.z * dark * 3.0;\n"
+"  c *= B.x;\n"
+"  c += detail * C.x * max(B.x, 1.0);\n"
+"  float ae = clamp(pow(E.y / key, 0.55), 0.25, 6.0);\n"
+"  c *= lerp(1.0, ae, E.x);\n"
+"  float l = Lm(c);\n"
+"  c += D.w * (1.0 - smoothstep(0.0, 0.6, l));\n"
+"  c = (c - 0.45) * C.y + 0.45;\n"
+"  float mx = max(c.r, max(c.g, c.b));\n"
+"  float mn = min(c.r, min(c.g, c.b));\n"
+"  float s0 = mx > 0.0001 ? (mx - mn) / mx : 0.0;\n"
+"  c = lerp(Lm(c).xxx, c, C.z * (1.0 + C.w * (1.0 - s0)));\n"
+"  c.r *= 1.0 + D.x * 0.16; c.b *= 1.0 - D.x * 0.16;\n"
+"  c = c * (1.0 + D.y) / (1.0 + max(c, 0.0) * D.y);\n"
+"  c = pow(max(c, 0.0), 1.0 / max(B.y, 0.05));\n"
+"  float r = length((uv - 0.5) * float2(A.z, 1.0));\n"
+"  c *= 1.0 + D.z * r * 0.85;\n"
+"  c += (hash(uv * 1024.0 + A.w) - 0.5) * E.w;\n"
+"  c = saturate(c);\n"
+"  if (E.z > 0.0) {\n"
+"    if (uv.x < E.z) c = raw;\n"
+"    if (abs(uv.x - E.z) < 2.0 / max(A.x * 1024.0, 1.0)) c = float3(1.0, 0.82, 0.15);\n"
+"  }\n"
+"  return float4(c, 1.0);\n"
+"}\n";
